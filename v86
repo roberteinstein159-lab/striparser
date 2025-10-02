@@ -1,0 +1,842 @@
+import asyncio
+import logging
+import sqlite3
+import re
+import time
+import os
+from datetime import datetime, timedelta
+import pytz
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+
+# Получение токена из переменных окружения (будет установлен на bothost.ru)
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
+
+# Московский часовой пояс
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+def init_db():
+    """Инициализация базы данных"""
+    conn = sqlite3.connect('models.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            schedule TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS model_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            is_online BOOLEAN,
+            has_sound BOOLEAN,
+            is_black_screen BOOLEAN,
+            viewers TEXT,
+            followers TEXT,
+            title TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+class StripchatMonitor:
+    def __init__(self):
+        self.driver = None
+        self.setup_driver()
+    
+    def setup_driver(self):
+        """Настройка Chrome драйвера для серверной среды"""
+        chrome_options = Options()
+        
+        # Опции для серверной среды
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--headless=new')
+        
+        # Опции для сети
+        chrome_options.add_argument('--ignore-certificate-errors')
+        chrome_options.add_argument('--ignore-ssl-errors')
+        chrome_options.add_argument('--disable-web-security')
+        chrome_options.add_argument('--allow-running-insecure-content')
+        
+        # Опции для производительности
+        chrome_options.add_argument('--disable-extensions')
+        chrome_options.add_argument('--disable-plugins')
+        chrome_options.add_argument('--disable-images')
+        chrome_options.add_argument('--blink-settings=imagesEnabled=false')
+        
+        # User-Agent
+        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        
+        # Отключение logging
+        chrome_options.add_argument('--log-level=3')
+        chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+        
+        # Дополнительные опции для стабильности
+        chrome_options.add_argument('--disable-features=VizDisplayCompositor')
+        chrome_options.add_argument('--disable-background-timer-throttling')
+        chrome_options.add_argument('--disable-backgrounding-occluded-windows')
+        chrome_options.add_argument('--disable-renderer-backgrounding')
+        
+        try:
+            # Для bothost.ru может потребоваться указать путь к Chrome
+            self.driver = webdriver.Chrome(options=chrome_options)
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            self.driver.set_page_load_timeout(30)
+            self.driver.set_script_timeout(30)
+            logger.info("✅ Драйвер успешно инициализирован")
+        except Exception as e:
+            logger.error(f"❌ Ошибка настройки драйвера: {e}")
+            self.driver = None
+
+    def get_model_status_with_retry(self, username, max_retries=3):
+        """Получение статуса модели с повторными попытками"""
+        for attempt in range(max_retries):
+            try:
+                status_data = self.get_model_status(username)
+                if status_data['error'] and 'connection' in status_data['error'].lower():
+                    logger.warning(f"⚠️ Попытка {attempt + 1}/{max_retries} для {username} - ошибка соединения")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+                        continue
+                return status_data
+            except Exception as e:
+                logger.error(f"❌ Ошибка в попытке {attempt + 1} для {username}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+                return {
+                    'timestamp': datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S MSK"),
+                    'username': username,
+                    'is_online': False,
+                    'has_sound': None,
+                    'is_black_screen': False,
+                    'viewers': 'N/A',
+                    'followers': 'N/A',
+                    'title': 'N/A',
+                    'error': f"Все попытки неудачны: {str(e)}"
+                }
+    
+    def get_model_status(self, username):
+        """Получение статуса модели по username"""
+        status_data = {
+            'timestamp': datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S MSK"),
+            'username': username,
+            'url': f"https://stripchat.com/{username}",
+            'is_online': False,
+            'has_sound': None,
+            'is_black_screen': False,
+            'viewers': 'N/A',
+            'followers': 'N/A',
+            'title': 'N/A',
+            'error': None
+        }
+        
+        try:
+            if not self.driver:
+                self.setup_driver()
+                if not self.driver:
+                    status_data['error'] = "Драйвер не инициализирован"
+                    return status_data
+            
+            logger.info(f"🔍 Проверяем модель: {username}")
+            self.driver.get(status_data['url'])
+            
+            try:
+                WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+            except TimeoutException:
+                status_data['error'] = "Таймаут загрузки страницы"
+                return status_data
+            
+            status_data['timestamp'] = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
+            
+            # Проверка онлайн статуса
+            status_data['is_online'] = self.check_online_status()
+            
+            # Если модель онлайн, проверяем звук и черный экран
+            if status_data['is_online']:
+                status_data['has_sound'] = self.check_sound_status()
+                status_data['is_black_screen'] = self.check_black_screen()
+                self.get_statistics(status_data)
+            
+            # Сохраняем статус в базу данных
+            self.save_model_status(status_data)
+            
+            logger.info(f"✅ Статус {username}: {'ONLINE' if status_data['is_online'] else 'OFFLINE'}")
+            return status_data
+            
+        except TimeoutException as e:
+            error_msg = f"Таймаут при проверке {username}: {str(e)}"
+            logger.error(error_msg)
+            status_data['error'] = error_msg
+            return status_data
+        except WebDriverException as e:
+            error_msg = f"Ошибка WebDriver для {username}: {str(e)}"
+            logger.error(error_msg)
+            status_data['error'] = error_msg
+            if 'connection' in str(e).lower() or 'reset' in str(e).lower():
+                try:
+                    self.close()
+                    time.sleep(2)
+                    self.setup_driver()
+                except Exception as restart_error:
+                    logger.error(f"❌ Ошибка перезапуска драйвера: {restart_error}")
+            return status_data
+        except Exception as e:
+            error_msg = f"Неожиданная ошибка для {username}: {str(e)}"
+            logger.error(error_msg)
+            status_data['error'] = error_msg
+            return status_data
+
+    def check_online_status(self):
+        """Проверка онлайн статуса модели"""
+        try:
+            online_indicators = [
+                "//*[contains(@class, 'online')]",
+                "//*[contains(@class, 'live')]",
+                "//*[contains(@class, 'stream')]",
+                "//*[contains(@class, 'broadcast')]",
+                "//*[contains(text(), 'online')]",
+                "//*[contains(text(), 'Live')]",
+            ]
+            
+            for indicator in online_indicators:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, indicator)
+                    for element in elements:
+                        if element.is_displayed():
+                            return True
+                except:
+                    continue
+            
+            # Проверка видео элементов
+            try:
+                video_elements = self.driver.find_elements(By.TAG_NAME, "video")
+                for video in video_elements:
+                    if video.is_displayed() and video.get_attribute("src"):
+                        return True
+            except:
+                pass
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки онлайн статуса: {e}")
+            return False
+
+    def check_sound_status(self):
+        """Проверка статуса звука"""
+        try:
+            sound_indicators = [
+                "//*[contains(@class, 'sound')]",
+                "//*[contains(@class, 'volume')]",
+                "//*[contains(@class, 'mute')]",
+                "//*[contains(@class, 'audio')]",
+            ]
+            
+            for indicator in sound_indicators:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, indicator)
+                    for element in elements:
+                        if element.is_displayed():
+                            element_info = (element.get_attribute('class') + ' ' + 
+                                          element.get_attribute('title') + ' ' + 
+                                          (element.text or '')).lower()
+                            
+                            if any(word in element_info for word in ['mute', 'off', 'false', 'disabled', 'нет звука']):
+                                return False
+                            elif any(word in element_info for word in ['unmute', 'on', 'true', 'enabled', 'со звуком']):
+                                return True
+                except:
+                    continue
+            
+            # Проверка видео элементов
+            try:
+                video_elements = self.driver.find_elements(By.TAG_NAME, "video")
+                for video in video_elements:
+                    if video.is_displayed():
+                        muted = video.get_attribute("muted")
+                        if muted == "true":
+                            return False
+                        elif muted == "false":
+                            return True
+            except:
+                pass
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки звука: {e}")
+        
+        return None
+
+    def check_black_screen(self):
+        """Проверка на черный экран"""
+        try:
+            video_elements = self.driver.find_elements(By.TAG_NAME, "video")
+            for video in video_elements:
+                if video.is_displayed() and video.get_attribute("src"):
+                    return False
+            
+            offline_indicators = [
+                "//*[contains(@class, 'offline')]",
+                "//*[contains(@class, 'black')]",
+                "//*[contains(text(), 'offline')]",
+                "//*[contains(text(), 'офлайн')]",
+            ]
+            
+            for indicator in offline_indicators:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, indicator)
+                    for element in elements:
+                        if element.is_displayed():
+                            return True
+                except:
+                    continue
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки черного экрана: {e}")
+            return False
+
+    def get_statistics(self, status_data):
+        """Получение статистики модели"""
+        try:
+            # Зрители
+            viewers_selectors = [
+                "//*[contains(@class, 'viewers')]",
+                "//*[contains(@class, 'spectators')]",
+                "//*[contains(text(), 'Viewers')]",
+                "//*[contains(text(), 'Зрители')]",
+            ]
+            
+            for selector in viewers_selectors:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, selector)
+                    for element in elements:
+                        if element.is_displayed() and element.text.strip():
+                            viewers_text = element.text.strip()
+                            viewers_text = re.sub(r'[^\d]', '', viewers_text)
+                            if viewers_text:
+                                status_data['viewers'] = viewers_text
+                            else:
+                                status_data['viewers'] = element.text.strip()
+                            break
+                    if status_data['viewers'] != 'N/A':
+                        break
+                except:
+                    continue
+            
+            # Подписчики
+            follower_selectors = [
+                "//*[contains(@class, 'followers')]",
+                "//*[contains(text(), 'Followers')]",
+                "//*[contains(text(), 'Подписчики')]",
+            ]
+            
+            for selector in follower_selectors:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, selector)
+                    for element in elements:
+                        if element.is_displayed() and element.text.strip():
+                            status_data['followers'] = element.text.strip()
+                            break
+                    if status_data['followers'] != 'N/A':
+                        break
+                except:
+                    continue
+            
+            # Заголовок трансляции
+            title_selectors = [
+                "//*[contains(@class, 'title')]",
+                "//*[contains(@class, 'stream-title')]",
+                "//h1",
+                "//h2",
+            ]
+            
+            for selector in title_selectors:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, selector)
+                    for element in elements:
+                        if element.is_displayed() and element.text.strip():
+                            status_data['title'] = element.text.strip()[:100]
+                            break
+                    if status_data['title'] != 'N/A':
+                        break
+                except:
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики: {e}")
+
+    def save_model_status(self, status_data):
+        """Сохранение статуса модели в базу данных"""
+        try:
+            conn = sqlite3.connect('models.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO model_status 
+                (username, is_online, has_sound, is_black_screen, viewers, followers, title)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                status_data['username'],
+                status_data['is_online'],
+                status_data['has_sound'],
+                status_data['is_black_screen'],
+                status_data['viewers'],
+                status_data['followers'],
+                status_data['title']
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения статуса: {e}")
+    
+    def close(self):
+        """Закрытие драйвера"""
+        if self.driver:
+            try:
+                self.driver.quit()
+                logger.info("✅ Драйвер закрыт")
+            except Exception as e:
+                logger.error(f"❌ Ошибка закрытия драйвера: {e}")
+
+# Глобальные переменные
+monitor = StripchatMonitor()
+
+def add_model(username, schedule=None):
+    """Добавление модели в базу данных"""
+    try:
+        conn = sqlite3.connect('models.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO models (username, schedule)
+            VALUES (?, ?)
+        ''', (username, schedule))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error adding model: {e}")
+        return False
+
+def remove_model(username):
+    """Удаление модели из базы данных"""
+    try:
+        conn = sqlite3.connect('models.db')
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM models WHERE username = ?', (username,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error removing model: {e}")
+        return False
+
+def get_all_models():
+    """Получение всех моделей из базы данных"""
+    try:
+        conn = sqlite3.connect('models.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT username, schedule FROM models')
+        models = cursor.fetchall()
+        conn.close()
+        return [{'username': row[0], 'schedule': row[1]} for row in models]
+    except Exception as e:
+        logger.error(f"Error getting models: {e}")
+        return []
+
+def get_model_schedule(username):
+    """Получение расписания модели"""
+    try:
+        conn = sqlite3.connect('models.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT schedule FROM models WHERE username = ?', (username,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    except Exception as e:
+        logger.error(f"Error getting schedule: {e}")
+        return None
+
+def update_model_schedule(username, schedule):
+    """Обновление расписания модели"""
+    try:
+        conn = sqlite3.connect('models.db')
+        cursor = conn.cursor()
+        cursor.execute('UPDATE models SET schedule = ? WHERE username = ?', (schedule, username))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error updating schedule: {e}")
+        return False
+
+def parse_schedule(schedule_text):
+    """Парсинг расписания из текста"""
+    lines = schedule_text.strip().split('\n')
+    if not lines:
+        return None
+    
+    username = lines[0].strip()
+    schedule_data = {'username': username, 'days': {}}
+    
+    days_mapping = {
+        'понедельник': 'monday',
+        'вторник': 'tuesday', 
+        'среда': 'wednesday',
+        'четверг': 'thursday',
+        'пятница': 'friday',
+        'суббота': 'saturday',
+        'воскресенье': 'sunday'
+    }
+    
+    for line in lines[1:]:
+        line = line.strip()
+        if not line or '-' not in line:
+            continue
+            
+        day_part, time_part = line.split('-', 1)
+        day_part = day_part.strip().lower()
+        time_part = time_part.strip()
+        
+        # Находим день недели
+        found_day = None
+        for ru_day, en_day in days_mapping.items():
+            if ru_day in day_part:
+                found_day = en_day
+                break
+        
+        if found_day:
+            if 'выходной' in time_part.lower():
+                schedule_data['days'][found_day] = 'day_off'
+            else:
+                time_ranges = []
+                for time_range in time_part.split(','):
+                    time_range = time_range.strip()
+                    if '-' in time_range:
+                        start_time, end_time = time_range.split('-')
+                        time_ranges.append({
+                            'start': start_time.strip(),
+                            'end': end_time.strip()
+                        })
+                schedule_data['days'][found_day] = time_ranges
+    
+    return schedule_data
+
+def is_model_working_now(schedule_data):
+    """Проверяет, должна ли модель работать сейчас по расписанию"""
+    if not schedule_data:
+        return False
+    
+    now = datetime.now(MOSCOW_TZ)
+    current_day = now.strftime('%A').lower()
+    current_time = now.strftime('%H:%M')
+    
+    day_schedule = schedule_data['days'].get(current_day)
+    
+    if day_schedule == 'day_off':
+        return False
+    
+    if isinstance(day_schedule, list):
+        for time_range in day_schedule:
+            if time_range['start'] <= current_time <= time_range['end']:
+                return True
+    
+    return False
+
+def get_main_keyboard():
+    """Главная клавиатура"""
+    keyboard = [
+        [InlineKeyboardButton("👤 Добавить модель", callback_data="add_model")],
+        [InlineKeyboardButton("🗑️ Удалить модель", callback_data="remove_model")],
+        [InlineKeyboardButton("📋 Список моделей", callback_data="list_models")],
+        [InlineKeyboardButton("⏰ Установить расписание", callback_data="set_schedule")],
+        [InlineKeyboardButton("🔄 Проверить все", callback_data="check_all")],
+        [InlineKeyboardButton("📊 Статус модели", callback_data="status_model")],
+        [InlineKeyboardButton("🚀 Запустить мониторинг", callback_data="monitor_all")],
+        [InlineKeyboardButton("🛑 Остановить мониторинг", callback_data="stop_monitor")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_cancel_keyboard():
+    """Клавиатура для отмены"""
+    keyboard = [
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    welcome_text = """
+🤖 Бот мониторинга Stripchat
+
+⏰ Все время указывается по Московскому времени (МСК)
+
+📅 Формат расписания:
+НИК_МОДЕЛИ
+Понедельник - 06:00-13:00
+Вторник - 06:30-13:30
+Среда - Выходной
+...
+
+Выберите действие:
+"""
+    await update.message.reply_text(welcome_text, reply_markup=get_main_keyboard())
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "add_model":
+        await query.edit_message_text(
+            "👤 Введите username модели:",
+            reply_markup=get_cancel_keyboard()
+        )
+        context.user_data['waiting_for'] = 'add_model'
+    
+    elif data == "remove_model":
+        models = get_all_models()
+        if not models:
+            await query.edit_message_text("📝 Список моделей пуст", reply_markup=get_main_keyboard())
+            return
+        
+        keyboard = []
+        for model in models:
+            keyboard.append([InlineKeyboardButton(f"👤 {model['username']}", callback_data=f"remove_{model['username']}")])
+        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+        
+        await query.edit_message_text(
+            "🗑️ Выберите модель для удаления:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "list_models":
+        models = get_all_models()
+        if not models:
+            await query.edit_message_text("📝 Список моделей пуст", reply_markup=get_main_keyboard())
+            return
+        
+        message = "📝 Модели в мониторинге:\n\n"
+        for model in models:
+            schedule_info = "⏰ Есть расписание" if model['schedule'] else "⏰ Без расписания"
+            message += f"👤 {model['username']} - {schedule_info}\n"
+        
+        await query.edit_message_text(message, reply_markup=get_main_keyboard())
+    
+    elif data == "set_schedule":
+        models = get_all_models()
+        if not models:
+            await query.edit_message_text("📝 Нет моделей для установки расписания", reply_markup=get_main_keyboard())
+            return
+        
+        keyboard = []
+        for model in models:
+            keyboard.append([InlineKeyboardButton(f"👤 {model['username']}", callback_data=f"schedule_{model['username']}")])
+        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+        
+        await query.edit_message_text(
+            "⏰ Выберите модель для установки расписания:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "check_all":
+        models = get_all_models()
+        if not models:
+            await query.edit_message_text("📝 Нет моделей для проверки", reply_markup=get_main_keyboard())
+            return
+        
+        await query.edit_message_text(f"🔄 Проверяю {len(models)} моделей...")
+        
+        results = []
+        for model in models:
+            try:
+                status_data = monitor.get_model_status_with_retry(model['username'])
+                
+                if status_data['error']:
+                    results.append(f"❌ {model['username']} - Ошибка: {status_data['error'][:50]}...")
+                else:
+                    if status_data['is_online']:
+                        sound_status = "🔊" if status_data['has_sound'] else "🔇" if status_data['has_sound'] is False else "❓"
+                        screen_status = "📺" if not status_data['is_black_screen'] else "⬛"
+                        status_emoji = f"🟢{sound_status}{screen_status}"
+                    else:
+                        status_emoji = "🔴"
+                    
+                    results.append(f"{status_emoji} {model['username']} - {status_data['viewers']}")
+                
+                await asyncio.sleep(2)
+                
+            except Exception as e:
+                results.append(f"❌ {model['username']} - Критическая ошибка: {str(e)}")
+        
+        message = "📊 Результаты проверки:\n\n" + "\n".join(results)
+        await query.edit_message_text(message, reply_markup=get_main_keyboard())
+    
+    elif data == "status_model":
+        models = get_all_models()
+        if not models:
+            await query.edit_message_text("📝 Нет моделей для проверки", reply_markup=get_main_keyboard())
+            return
+        
+        keyboard = []
+        for model in models:
+            keyboard.append([InlineKeyboardButton(f"👤 {model['username']}", callback_data=f"status_{model['username']}")])
+        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+        
+        await query.edit_message_text(
+            "📊 Выберите модель для проверки статуса:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif data == "monitor_all":
+        await query.edit_message_text("🚀 Запускаю мониторинг всех моделей...")
+        await query.edit_message_text("✅ Мониторинг запущен", reply_markup=get_main_keyboard())
+    
+    elif data == "stop_monitor":
+        await query.edit_message_text("🛑 Останавливаю мониторинг...")
+        await query.edit_message_text("✅ Мониторинг остановлен", reply_markup=get_main_keyboard())
+    
+    elif data.startswith("remove_"):
+        username = data.replace("remove_", "")
+        if remove_model(username):
+            await query.edit_message_text(f"✅ Модель {username} удалена", reply_markup=get_main_keyboard())
+        else:
+            await query.edit_message_text(f"❌ Ошибка при удалении {username}", reply_markup=get_main_keyboard())
+    
+    elif data.startswith("schedule_"):
+        username = data.replace("schedule_", "")
+        context.user_data['waiting_for'] = 'set_schedule'
+        context.user_data['schedule_username'] = username
+        
+        current_schedule = get_model_schedule(username)
+        schedule_example = """Пример формата:
+НИК_МОДЕЛИ
+Понедельник - 06:00-13:00
+Вторник - 06:30-13:30
+Среда - Выходной
+Четверг - Выходной
+Пятница - 06:00-13:00
+Суббота - 06:30-13:30
+Воскресенье - 06:30-13:30"""
+        
+        message = f"⏰ Установите расписание для {username}:\n\n{schedule_example}"
+        if current_schedule:
+            message += f"\n\nТекущее расписание:\n{current_schedule}"
+        
+        await query.edit_message_text(message, reply_markup=get_cancel_keyboard())
+    
+    elif data.startswith("status_"):
+        username = data.replace("status_", "")
+        await query.edit_message_text(f"🔄 Проверяю статус {username}...")
+        
+        status_data = monitor.get_model_status_with_retry(username)
+        
+        if status_data['error']:
+            message = f"❌ Ошибка при проверке {username}:\n{status_data['error']}"
+        else:
+            status_emoji = "🟢 ONLINE" if status_data['is_online'] else "🔴 OFFLINE"
+            sound_status = "🔊 Со звуком" if status_data['has_sound'] else "🔇 Без звука" if status_data['has_sound'] is False else "❓ Неизвестно"
+            screen_status = "📺 Есть видео" if not status_data['is_black_screen'] else "⬛ Черный экран"
+            
+            message = f"""📊 Статус {username}:
+{status_emoji}
+{sound_status}
+{screen_status}
+👥 Зрители: {status_data['viewers']}
+❤️ Подписчики: {status_data['followers']}
+📝 Заголовок: {status_data['title']}
+⏰ Время проверки: {status_data['timestamp']}"""
+        
+        await query.edit_message_text(message, reply_markup=get_main_keyboard())
+    
+    elif data == "cancel":
+        context.user_data.pop('waiting_for', None)
+        context.user_data.pop('schedule_username', None)
+        await query.edit_message_text("❌ Действие отменено", reply_markup=get_main_keyboard())
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений"""
+    text = update.message.text
+    user_data = context.user_data
+    
+    if 'waiting_for' not in user_data:
+        if any(day in text.lower() for day in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']):
+            await update.message.reply_text("📅 Обнаружено расписание. Обрабатываю...")
+        return
+    
+    waiting_for = user_data['waiting_for']
+    
+    if waiting_for == 'add_model':
+        username = text.strip().lower()
+        if add_model(username):
+            await update.message.reply_text(f"✅ Модель {username} добавлена!", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text("❌ Ошибка при добавлении", reply_markup=get_main_keyboard())
+        user_data.pop('waiting_for', None)
+    
+    elif waiting_for == 'set_schedule':
+        username = user_data.get('schedule_username')
+        if username and update_model_schedule(username, text):
+            await update.message.reply_text(f"✅ Расписание для {username} обновлено!", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text("❌ Ошибка при обновлении расписания", reply_markup=get_main_keyboard())
+        user_data.pop('waiting_for', None)
+        user_data.pop('schedule_username', None)
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Exception while handling an update: {context.error}")
+
+def main():
+    """Основная функция"""
+    # Проверка наличия токена
+    if not TELEGRAM_TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
+        logger.error("💡 Установите токен в настройках бота на bothost.ru")
+        return
+    
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(error_handler)
+    
+    logger.info("🤖 Бот запущен на bothost.ru...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 Бот остановлен")
+    finally:
+        monitor.close()
