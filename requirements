@@ -1,0 +1,3 @@
+python-telegram-bot==20.7
+selenium==4.15.0
+pytz==2023.3
